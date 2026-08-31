@@ -1,0 +1,2 @@
+# This file intentionally mirrors the legacy RViz config used by the stack.
+# It is kept in the new launch package so the master launch no longer depends on the old package.

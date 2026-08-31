@@ -1,0 +1,58 @@
+# ROS 2 / build outputs
+build/
+install/
+log/
+eval_plots/
+
+# Python virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Local ML/TF/ONNX/TensorRT artifacts
+*.onnx
+*.engine
+*.pt
+*.pth
+*.pb
+*.tflite
+*.h5
+*.ckpt
+*.ckpt.*
+trt_engine_cache/
+onnx_model/
+shared_cache/
+
+# Logs and temp files
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*.out
+
+# Editor settings
+.vscode/
+
+# Generated media
+*.avi
+*.mp4
+*.gif
+
+# Generated metrics and data exports
+metrics.json
+*.csv
+
+# Python package metadata
+*.egg-info/
+
+# Common OS files
+.DS_Store
+Thumbs.db
