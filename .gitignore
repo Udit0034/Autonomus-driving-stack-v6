@@ -2,7 +2,7 @@
 build/
 install/
 log/
-eval_plots/
+
 
 # Python virtual environments
 venv/
@@ -48,6 +48,7 @@ shared_cache/
 
 # Generated metrics and data exports
 metrics.json
+eval_plots/ekf_metrics.json
 *.csv
 
 # Python package metadata
