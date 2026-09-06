@@ -7,7 +7,7 @@
 ![TensorRT](https://img.shields.io/badge/NVIDIA-TensorRT-76B900?logo=nvidia&logoColor=white)
 ![Platform](https://img.shields.io/badge/AWS-G4dn%20(T4)-FF9900?logo=amazon-aws&logoColor=white)
 
-A closed-loop, modular autonomous driving pipeline deployed in CARLA simulation. This stack integrates multi-camera TensorRT perception, PCL NDT-SLAM localization, Error-State Kalman Filter (ESKF) sensor fusion, Frenet-frame lattice planning, and Stanley/PID control across **10 domain-separated ROS 2 packages**.
+A closed-loop, modular autonomous driving pipeline deployed in CARLA simulation. This stack integrates multi-camera TensorRT perception, PCL NDT-SLAM localization, Error-State Kalman Filter (ESKF) sensor fusion, Frenet-frame lattice planning, and Pure Pursuit/PID control across **10 domain-separated ROS 2 packages**.
 
 **V6 Architecture Update:** This iteration entirely removes the Python-based CARLA bridge, migrating to a native, highly-performant ROS 2 DDS architecture utilizing `ros-carla-msgs` for direct simulator-to-stack communication.
 
@@ -41,7 +41,7 @@ flowchart LR
     LOC["State Estimation\nESKF · NDT-SLAM · VO"]
     ENV["Environment Model\nOccupancy grids · TTC"]
     PLAN["Planning\nLattice · Behavior · VPG"]
-    CTRL["Control\nStanley + PID"]
+    CTRL["Control\nPure Pursuit + PID"]
 
     CARLA -->|ros-carla-msgs| PERC
     CARLA -->|ros-carla-msgs| LOC
@@ -61,7 +61,7 @@ flowchart LR
 
 **Planning** — Global mission planner over CARLA topology, Frenet-frame lattice trajectory optimization, behavioral state machine (speed limits, intersection logic), curvature-aware velocity profile generation.
 
-**Control** — Stanley lateral controller + PID longitudinal controller closing the loop to CARLA actuation natively.
+**Control** — Pure Pursuit lateral controller + PID longitudinal controller closing the loop to CARLA actuation natively at 50 Hz, asynchronous from the perception cadence.
 
 ---
 
@@ -104,7 +104,7 @@ The stack enforces a strict separation of concerns, splitting domains into dedic
 
 | Node | Lang | Responsibility |
 | --- | --- | --- |
-| `carla_controller_node` | C++ | Stanley lateral + PID longitudinal → `CarlaEgoVehicleControl` |
+| `carla_controller_node` | C++ | Pure Pursuit lateral + PID longitudinal → `CarlaEgoVehicleControl` at 50 Hz |
 
 ### `autonomy_evaluation` (Python)
 
@@ -122,7 +122,8 @@ All figures measured in closed-loop CARLA simulation on a single **AWS G4dn inst
 
 | Metric | Value | Notes |
 | --- | --- | --- |
-| End-to-end loop latency | **~89 ms (~11 FPS)** | Perception + localization + planning + control on shared T4 |
+| Perception throughput | **~89 ms (~11 FPS)** | 5-camera TRT inference under full-stack co-located GPU load on T4 |
+| Control loop rate | **50 Hz (20 ms)** | Pure Pursuit + PID running asynchronously, independent of perception cadence |
 | Average closed-loop speed | **5.96 m/s (~21.5 km/h)** | Urban driving scenario |
 | Validation run length | 157 s / 2,789 samples | Continuous closed-loop urban route, Town01 |
 
@@ -174,7 +175,7 @@ autonomous-driving-stack-v6/
 │   ├── autonomy_planning/          # Python: Mission planner, Velocity Profile Generation (VPG)
 │   ├── autonomy_planning_cpp/      # C++: Frenet lattice planner, behavioral state machine
 │   ├── autonomy_control/           # Launch & Configs for control
-│   ├── autonomy_control_cpp/       # C++: Stanley + PID controllers
+│   ├── autonomy_control_cpp/       # C++: Pure Pursuit + PID controllers
 │   ├── autonomy_evaluation/        # Python: Real-time RMSE evaluation node
 │   └── ros-carla-msgs/             # Native ROS 2 message definitions for CARLA
 └── utils/                          # Offline analysis scripts (EKF, planning logs)
@@ -247,7 +248,7 @@ python utils/analyze_ekf_performance.py \
 
 ## Known Limitations
 
-* **Single-GPU contention:** CARLA rendering and TRT engines share one T4 — full-stack throughput (~11 FPS) is lower than standalone perception figures.
+* **Single-GPU contention:** CARLA rendering and TRT engines share one T4 — perception throughput (~11 FPS) is lower than standalone figures; control runs asynchronously at 50 Hz and is unaffected.
 * **VO scale drift:** Monocular visual odometry exhibits ~9.77% scale drift over extended open loops before fusion correction; currently mitigated by tightly coupled IMU/wheel-encoder fusion in the ESKF.
 * **Static environment assumption:** Lattice and behavior planners currently handle fixed obstacle scenarios; dynamic multi-agent interaction is not yet modeled.
 
