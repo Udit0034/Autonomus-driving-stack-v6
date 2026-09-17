@@ -9,7 +9,7 @@
 
 A closed-loop, modular autonomous driving pipeline deployed in CARLA simulation. This architecture integrates multi-camera TensorRT perception, PCL NDT-SLAM, a 12-state Error-State Kalman Filter (ES-EKF) with Non-Holonomic Constraints (NHC), Frenet-frame lattice planning, and decoupled Pure Pursuit/PID control across **9 domain-separated ROS 2 packages**.
 
-**V6 Architecture Update:** Eliminates external bridge layers by adopting native ROS 2 DDS communication via `ros-carla-msgs` directly within the CARLA client node. Sensor publishing runs asynchronously across distinct physical cadences (100 Hz IMU, 50 Hz Wheel/Mag, 30 Hz Vision, 10 Hz LiDAR, 1 Hz Dual GNSS).
+**V6 Architecture Update:** Eliminates external bridge layers by adopting native ROS 2 DDS communication via `ros-carla-msgs` directly within the CARLA client node. Sensor publishing runs synchronously across distinct physical cadences (100 Hz IMU, 50 Hz Wheel/Mag, 30 Hz Vision, 10 Hz LiDAR, 1 Hz Dual GNSS).
 
 > **Deployment Status:** Deployed and running closed-loop navigation in CARLA simulation.
 > 
@@ -26,7 +26,7 @@ A closed-loop, modular autonomous driving pipeline deployed in CARLA simulation.
 ## Contents
 
 * [Architecture](#architecture)
-* [Sensor Cadence & Asynchronous Topology](#sensor-cadence--asynchronous-topology)
+* [Sensor Cadence & Synchronous Topology](#sensor-cadence--synchronous-topology)
 * [Metrics](#metrics)
 * [Repository Layout](#repository-layout)
 * [Getting Started](#getting-started)
@@ -70,9 +70,9 @@ flowchart LR
 
 ---
 
-### Sensor Cadence & Asynchronous Topology
+### Sensor Cadence & Synchronous Topology
 
-The stack operates across asynchronous sensor rates managed by `carla_node_native.py`:
+The stack operates across synchronous sensor rates managed by `carla_node_native.py`:
 
 | Sensor | Update Rate | Frame / Topic | Description |
 | --- | --- | --- | --- |
@@ -197,7 +197,7 @@ ros2 launch autonomy_stack main.launch.py with_rviz:=true debug:=false
 
 ## Evaluation & Benchmarking
 
-When `Ctrl+C` is pressed, `evaluate_node.py` dumps synchronized telemetry logs and asynchronously spawns `metric_viz.py`:
+When `Ctrl+C` is pressed, `evaluate_node.py` dumps synchronized telemetry logs and synchronously spawns `metric_viz.py`:
 
 ```bash
 # Generate plots and metrics manually from an existing run log
@@ -224,7 +224,7 @@ Metrics and trajectory comparison figures will be exported directly into `eval_p
 ### V6.1 Roadmap
 
 * **NDT-SLAM Parameter Optimization:** Optimize voxel leaf sizes, step sizes, and keyframe intervals to reduce scan-matching error and tighten drift bounds.
-* **Visual Odometry Enhancements:** Upgrade visual feature handling and scale constraints based on our [`Vision-LiDAR-Odometry-Benchmark`](#) findings.
+* **Visual Odometry Enhancements:** Upgrade visual feature handling and scale constraints based on our [`Vision-LiDAR-Odometry-Benchmark`](https://github.com/Udit0034/visual-lidar-odometry-benchmark) findings.
 * **Realistic Sensor Noise Profiles:** Transition from default noise-free CARLA sensor parameters to realistic Gaussian noise, bias walk, and wheel slip profiles, followed by re-tuning EKF covariance matrices for field robustness.
 * **Degraded Condition Fault-Tolerance:** Evaluate stack robustness under edge-case conditions (GNSS denial, camera lens occlusion, fog/rain, sensor dropouts) and deploy automatic safety fallback modes.
 * **Analytical Jerk Filtering:** Upgrade the evaluation node to calculate passenger comfort metrics from filtered accelerometer telemetry rather than discrete derivative steps.
