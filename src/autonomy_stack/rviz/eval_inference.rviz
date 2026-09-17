@@ -1,2 +1,32 @@
-# This file intentionally mirrors the legacy RViz config used by the stack.
-# It is kept in the new launch package so the master launch no longer depends on the old package.
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Name: Grid
+      Class: rviz_default_plugins/Grid
+      Enabled: true
+      Cell Size: 1
+      Plane Cell Count: 50
+
+    # ==========================================
+    # INFERENCE MODE (Always On)
+    # ==========================================
+    - Name: EKF Odometry (Blue)
+      Class: rviz_default_plugins/Odometry
+      Enabled: true
+      Topic: /ekf/odometry
+      Color: 0; 112; 255
+      Keep: 200
+      Shape: Arrow
+      
+    - Name: Pred BEV
+      Class: rviz_default_plugins/Image
+      Enabled: true
+      Topic: /dashboard/pred/bev
+      
+    - Name: SLAM Occupancy
+      Class: rviz_default_plugins/Image
+      Enabled: true
+      Topic: /dashboard/slam/occupancy
+
+  Global Options:
+    Fixed Frame: odom

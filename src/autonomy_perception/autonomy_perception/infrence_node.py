@@ -160,6 +160,9 @@ class InferenceNode(Node):
         
         self.declare_parameter('debug_mode', False)
         self.debug_mode = self.get_parameter('debug_mode').get_parameter_value().bool_value
+        
+        # Shutdown flag to prevent InvalidHandle crashes
+        self.is_shutting_down = False
 
         self.cpu_executor = concurrent.futures.ThreadPoolExecutor(max_workers=12)
         self.engine_dir = "/home/ubuntu/AV6/shared_cache/trt_engine_cache"
@@ -214,12 +217,14 @@ class InferenceNode(Node):
         self.inference_publishers = {cam: {} for cam in self.camera_names}
         for cam in self.camera_names:
             self.create_subscription(Image, f'/carla/hero/{cam}/image', lambda msg, c=cam: self.image_callback(msg, c), qos_profile_sensor_data)
+            
+            # FIX: Always create front_left Depth & Seg publishers so TTC Fusion and RViz can see them!
             if cam == 'front_left':
                 self.inference_publishers[cam]['depth'] = self.create_publisher(Image, f'/inference/{cam}/depth', 10)
-            if self.debug_mode:
                 self.inference_publishers[cam]['seg'] = self.create_publisher(Image, f'/inference/{cam}/seg', 10)
-                if cam != 'front_left':
-                    self.inference_publishers[cam]['depth'] = self.create_publisher(Image, f'/inference/{cam}/depth', 10)
+            elif self.debug_mode:
+                self.inference_publishers[cam]['depth'] = self.create_publisher(Image, f'/inference/{cam}/depth', 10)
+                self.inference_publishers[cam]['seg'] = self.create_publisher(Image, f'/inference/{cam}/seg', 10)
 
         self.bev_pub = self.create_publisher(Image, '/dashboard/pred/bev', 10)
         self.traffic_light_pub = self.create_publisher(String, '/inference/front_left/traffic_lights', 10)
@@ -281,7 +286,6 @@ class InferenceNode(Node):
 
                 valid = (d > 0.5) & (d < grid['max_depth']) & (s != 0) & (s != 11)
                 
-                # ── FIXED: Removed .any() sync blocks. PyTorch seamlessly processes 0-length arrays.
                 d_v = d[valid]
                 s_v = s[valid].to(torch.uint8)
                 pts = grid['rot_rays'][:, valid] * d_v + grid['T']
@@ -306,18 +310,19 @@ class InferenceNode(Node):
                 label_flat = self.bev_labels.view(-1)
                 label_flat.scatter_(0, flat_idx, s_b)
             
-            # Clamp only once per frame, not per camera
             self.bev_conf.clamp_(max=1.0)
                 
             bev = torch.zeros((800, 500), dtype=torch.uint8, device="cuda")
-            mask = self.bev_conf >= 0.6
+            # FIX: Lowered BEV threshold so individual hits show up instantly
+            mask = self.bev_conf >= 0.4
             bev[mask] = self.bev_labels[mask]
             
             bev_resized = F.interpolate(bev.unsqueeze(0).unsqueeze(0).float(), size=(500, 500), mode='nearest').squeeze().to(torch.uint8)
             return bev_resized
             
         except Exception:
-            self.get_logger().error(f"GPU BEV Compute Error:\n{traceback.format_exc()}")
+            if not self.is_shutting_down:
+                self.get_logger().error(f"GPU BEV Compute Error:\n{traceback.format_exc()}")
             return torch.zeros((500, 500), dtype=torch.uint8, device="cuda")
 
     def image_callback(self, image_msg, cam):
@@ -340,6 +345,7 @@ class InferenceNode(Node):
         return tensor_norm, tensor_float, baked_tensor
 
     def publish_bev_worker(self, bev_tensor, header):
+        if self.is_shutting_down: return
         try:
             bev_np = np.ascontiguousarray(bev_tensor.cpu().numpy(), dtype=np.uint8)
             img_msg = self.bridge.cv2_to_imgmsg(bev_np, encoding="mono8")
@@ -350,6 +356,7 @@ class InferenceNode(Node):
             pass
 
     def process_and_publish_worker(self, cam, depth_tensor, seg_tensor, header):
+        if self.is_shutting_down: return
         try:
             if not self.debug_mode and cam != 'front_left': return
             
@@ -368,7 +375,7 @@ class InferenceNode(Node):
             pass
 
     def process_detections_worker(self, yolo_tensor, depth_tensor, seg_tensor, raw_image_tensor, header):
-        if seg_tensor is None:
+        if self.is_shutting_down or seg_tensor is None:
             return 
 
         try:
@@ -441,7 +448,7 @@ class InferenceNode(Node):
                     "semantic_id": mode_seg
                 })
 
-            if objects_packet["detections"]:
+            if objects_packet["detections"] and not self.is_shutting_down:
                 self.dynamic_objects_pub.publish(String(data=json.dumps(objects_packet)))
 
             light_packet = {"header": {"stamp": {"sec": header.stamp.sec, "nanosec": header.stamp.nanosec}}, "camera_meta": self.camera_metadata["front_left"], "detections": []}
@@ -494,15 +501,18 @@ class InferenceNode(Node):
                         "cnn_confidence": cnn_confidence
                     })
 
-            if light_packet["detections"]: 
-                self.traffic_light_pub.publish(String(data=json.dumps(light_packet)))
-            if sign_payload:
-                self.traffic_sign_pub.publish(String(data=json.dumps(sign_payload)))
+            if not self.is_shutting_down:
+                if light_packet["detections"]: 
+                    self.traffic_light_pub.publish(String(data=json.dumps(light_packet)))
+                if sign_payload:
+                    self.traffic_sign_pub.publish(String(data=json.dumps(sign_payload)))
 
         except Exception:
-            self.get_logger().error(f"Detection Worker Thread Error:\n{traceback.format_exc()}")
+            if not self.is_shutting_down:
+                self.get_logger().error(f"Detection Worker Thread Error:\n{traceback.format_exc()}")
 
     def _gpu_pipeline_worker(self, frames_to_process, wall_t0):
+        if self.is_shutting_down: return
         try:
             t0 = time.perf_counter()
             gpu_tensors, baked_tensors, headers = {}, {}, {}
@@ -576,12 +586,14 @@ class InferenceNode(Node):
 
             bev_tensor = self.compute_bev_on_gpu(d_maps_gpu, s_maps_gpu)
             
-            if 'front_left' in headers:
-                self.cpu_executor.submit(self.publish_bev_worker, bev_tensor, headers['front_left'])
+            if not self.is_shutting_down:
+                if 'front_left' in headers:
+                    self.cpu_executor.submit(self.publish_bev_worker, bev_tensor, headers['front_left'])
 
-            if self.debug_mode:
                 if 'front_left' in frames_to_process and (fl_depth_tensor is not None or fl_seg_tensor is not None):
                     self.cpu_executor.submit(self.process_and_publish_worker, 'front_left', fl_depth_tensor, fl_seg_tensor, headers['front_left'])
+                
+                # Check if we should publish other cameras too
                 for cam in ['rear', 'side_left', 'side_right']:
                     if cam in frames_to_process:
                         d_t = d_maps_gpu.get(cam)
@@ -589,12 +601,12 @@ class InferenceNode(Node):
                         if d_t is not None or s_t is not None:
                             self.cpu_executor.submit(self.process_and_publish_worker, cam, d_t, s_t, headers[cam])
 
-            if 'yolo' in results:
-                yolo_tensor = results['yolo'][0].squeeze().T
-                if fl_seg_tensor is not None:
-                    self.cpu_executor.submit(self.process_detections_worker, yolo_tensor, fl_depth_tensor, fl_seg_tensor, fl_raw, headers['front_left'])
+                if 'yolo' in results:
+                    yolo_tensor = results['yolo'][0].squeeze().T
+                    if fl_seg_tensor is not None:
+                        self.cpu_executor.submit(self.process_detections_worker, yolo_tensor, fl_depth_tensor, fl_seg_tensor, fl_raw, headers['front_left'])
 
-            self.heartbeat_pub.publish(Bool(data=True))
+                self.heartbeat_pub.publish(Bool(data=True))
 
             self.t_post.append((time.perf_counter() - t0) * 1000.0)
             self.t_wall.append((time.perf_counter() - wall_t0) * 1000.0)
@@ -613,12 +625,13 @@ class InferenceNode(Node):
                 self.t_prep, self.t_infer, self.t_post, self.t_wall = [], [], [], []
 
         except Exception:
-            self.get_logger().error(f"Inference execution failed:\n{traceback.format_exc()}")
+            if not self.is_shutting_down:
+                self.get_logger().error(f"Inference execution failed:\n{traceback.format_exc()}")
         finally:
             self.gpu_future = None  
 
     def inference_loop(self):
-        if self.gpu_future is not None and not self.gpu_future.done():
+        if self.is_shutting_down or (self.gpu_future is not None and not self.gpu_future.done()):
             return
             
         frames_to_process = {}
@@ -632,7 +645,15 @@ class InferenceNode(Node):
             return
 
         wall_t0 = time.perf_counter()
-        self.gpu_future = self.cpu_executor.submit(self._gpu_pipeline_worker, frames_to_process, wall_t0)
+        try:
+            self.gpu_future = self.cpu_executor.submit(self._gpu_pipeline_worker, frames_to_process, wall_t0)
+        except RuntimeError:
+            pass
+
+    def destroy_node(self):
+        self.is_shutting_down = True
+        self.cpu_executor.shutdown(wait=False)
+        super().destroy_node()
 
 def main(args=None):
     rclpy.init(args=args)
@@ -642,7 +663,6 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.cpu_executor.shutdown(wait=False)
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

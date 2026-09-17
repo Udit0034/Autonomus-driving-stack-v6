@@ -46,7 +46,12 @@ public:
 
 class NdtSlamNode : public rclcpp::Node {
 public:
-    NdtSlamNode() : Node("ndt_slam_node"), ekf_initialized_(false), map_initialized_(false) {
+    NdtSlamNode() : Node("ndt_slam_node"), 
+                    ekf_initialized_(false), 
+                    map_initialized_(false),
+                    slam_pose_(Matrix4f_Unaligned::Identity()),
+                    slam_pose_initialized_(false),
+                    ekf_trust_distance_(0.0f) {
         
         // Mute PCL terminal spam
         pcl::console::setVerbosityLevel(pcl::console::L_ALWAYS);
@@ -54,21 +59,47 @@ public:
         ekf_guess_ = Matrix4f_Unaligned::Identity();
         last_keyframe_pose_ = Matrix4f_Unaligned::Identity();
         
+        // Initialize lever arm transform
+        lidar_to_base_ = Eigen::Matrix4f::Identity();
+        lidar_to_base_(2, 3) = -2.10f; // LiDAR is 2.1m above base_link, offset points to base frame
+        
         target_map_cloud_.reset(new pcl::PointCloud<pcl::PointXYZ>());
 
-        // Standard SLAM Params
-        this->declare_parameter("voxel_size", 0.75);
-        this->declare_parameter("ndt_transformation_epsilon", 0.01);
-        this->declare_parameter("ndt_step_size", 0.1);
-        this->declare_parameter("ndt_resolution", 3.0);
-        this->declare_parameter("ndt_max_iterations", 30);
-        this->declare_parameter("keyframe_distance", 1.0);
+        // Tuned Standard SLAM Params
+        this->declare_parameter("voxel_size", 0.3);
+        this->declare_parameter("ndt_transformation_epsilon", 0.001);
+        this->declare_parameter("ndt_step_size", 0.05);
+        this->declare_parameter("ndt_resolution", 1.5);
+        this->declare_parameter("ndt_max_iterations", 60);
+        this->declare_parameter("keyframe_distance", 0.5);
 
         // Map Persistence & Mode Params
         this->declare_parameter("map_file", "");           
         this->declare_parameter("mapping_mode", true);     
         this->declare_parameter("map_extend_radius", 5.0); 
 
+        // 🎯 ANTI-SIGFPE Parameter Fallbacks 
+        // 🚨 CRITICAL FIX: Set NDT parameters BEFORE loading the map to prevent segfaults
+        double v_size = this->get_parameter("voxel_size").as_double();
+        if (v_size <= 0.01) v_size = 0.3;
+        voxel_filter_.setLeafSize(v_size, v_size, v_size);
+
+        double epsilon = this->get_parameter("ndt_transformation_epsilon").as_double();
+        if (epsilon <= 0.0) epsilon = 0.001;
+        ndt_.setTransformationEpsilon(epsilon);
+
+        double step = this->get_parameter("ndt_step_size").as_double();
+        if (step <= 0.0) step = 0.05;
+        ndt_.setStepSize(step);
+
+        double res = this->get_parameter("ndt_resolution").as_double();
+        if (res <= 0.0) res = 1.5;
+        ndt_.setResolution(res);
+        
+        ndt_.setMaximumIterations(this->get_parameter("ndt_max_iterations").as_int());
+        ndt_.setMinPointPerVoxelSafe(6);
+
+        // ✅ MAP LOADING MOVED HERE: Now NDT has valid settings when building the KD-Tree
         map_file_ = this->get_parameter("map_file").as_string();
         mapping_mode_ = this->get_parameter("mapping_mode").as_bool();
 
@@ -84,26 +115,6 @@ public:
             }
         }
 
-        // 🎯 ANTI-SIGFPE Parameter Fallbacks
-        double v_size = this->get_parameter("voxel_size").as_double();
-        if (v_size <= 0.01) v_size = 0.75;
-        voxel_filter_.setLeafSize(v_size, v_size, v_size);
-
-        double epsilon = this->get_parameter("ndt_transformation_epsilon").as_double();
-        if (epsilon <= 0.0) epsilon = 0.01;
-        ndt_.setTransformationEpsilon(epsilon);
-
-        double step = this->get_parameter("ndt_step_size").as_double();
-        if (step <= 0.0) step = 0.1;
-        ndt_.setStepSize(step);
-
-        double res = this->get_parameter("ndt_resolution").as_double();
-        if (res <= 0.0) res = 3.0;
-        ndt_.setResolution(res);
-        
-        ndt_.setMaximumIterations(this->get_parameter("ndt_max_iterations").as_int());
-        ndt_.setMinPointPerVoxelSafe(6);
-
         // Subscribers & Publishers
         bev_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
             "/dashboard/pred/bev", 10, std::bind(&NdtSlamNode::bevCallback, this, std::placeholders::_1));
@@ -118,7 +129,6 @@ public:
         ndt_odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("/slam/odometry", 10);
     }
 
-    // Save map on node shutdown
     ~NdtSlamNode() {
         if (mapping_mode_ && !map_file_.empty() && target_map_cloud_ && !target_map_cloud_->empty()) {
             RCLCPP_INFO(this->get_logger(), "💾 Saving map: %zu points to %s", 
@@ -164,7 +174,6 @@ private:
         ekf_initialized_ = true;
     }
 
-    // Helper to validate if an Eigen matrix contains valid non-infinite numbers
     template<typename T>
     bool isMatrixValid(const T& mat, std::string& reason) {
         if (!mat.allFinite()) {
@@ -182,31 +191,36 @@ private:
 
         pcl::PointCloud<pcl::PointXYZ>::Ptr raw_cloud(new pcl::PointCloud<pcl::PointXYZ>());
         pcl::fromROSMsg(*msg, *raw_cloud);
+        
+        pcl::PointCloud<pcl::PointXYZ>::Ptr base_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+        pcl::transformPointCloud(*raw_cloud, *base_cloud, lidar_to_base_);
 
         pcl::PointCloud<pcl::PointXYZ>::Ptr filtered_cloud(new pcl::PointCloud<pcl::PointXYZ>());
         
         size_t non_finite_count = 0;
         size_t close_proximity_count = 0;
 
-        for (auto pt : raw_cloud->points) {
-            // 1. Check for non-finite values (NaN/Inf)
+        for (auto pt : base_cloud->points) {
             if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) {
                 non_finite_count++;
                 continue;
             }
             
             double sq_dist = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
-            // 2. Filter out self-reflections/proximity noise
+            
             if (sq_dist <= 1.0) {
                 close_proximity_count++;
                 continue;
             }
             
-            // Anti-Plane Uniform Jitter (Noise injection to break zero-variance mathematical planes)
-            pt.x += ((rand() % 100) / 100.0f - 0.5f) * 0.01f;
-            pt.y += ((rand() % 100) / 100.0f - 0.5f) * 0.01f;
-            pt.z += ((rand() % 100) / 100.0f - 0.5f) * 0.03f;
-
+            if (sq_dist > 2500.0) {
+                continue;
+            }
+            
+            if (pt.z < -0.3f) {
+                continue; 
+            }
+            
             bool is_dynamic = false;
             if (!latest_bev_.empty() && latest_bev_.rows == 800 && latest_bev_.cols == 500) {
                 int r = static_cast<int>((50.0f - pt.x) * 10.0f);
@@ -225,7 +239,6 @@ private:
             }   
         }
 
-        // Print out explicit reporting for discarded points
         if (non_finite_count > 0 || close_proximity_count > 0) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                 "⚠️ [Data Filter] Discarded Points: %zu Non-Finite (NaN/Inf), %zu Ego-Proximity (<1m)", 
@@ -237,33 +250,49 @@ private:
         voxel_filter_.filter(*downsampled);
 
         if (downsampled->empty()) {
-            RCLCPP_ERROR(this->get_logger(), "❌ [Voxel Filter] Cloud is completely empty after downsampling! Skipping frame.");
             return;
         }
 
-        Matrix4f_Unaligned current_guess = ekf_guess_;
+        Matrix4f_Unaligned current_guess;
+        if (slam_pose_initialized_) {
+            // 1. Calculate how much the EKF says we moved since the last LiDAR frame
+            Matrix4f_Unaligned ekf_delta = last_ekf_pose_.inverse() * ekf_guess_;
+            
+            // 2. Apply that relative movement to our last known good SLAM pose
+            current_guess = slam_pose_ * ekf_delta;
+
+            // ✅ BLEND LOGIC MOVED HERE: Safely out of the way of the very first frame
+            float ekf_slam_dist = (ekf_guess_.block<3,1>(0,3) - slam_pose_.block<3,1>(0,3)).norm();
+            if (ekf_slam_dist < 3.0f) {  // only blend if EKF is within 3m of SLAM
+                float alpha = 0.15f;     // 15% EKF, 85% SLAM continuity
+                current_guess.block<3,1>(0,3) = 
+                    (1.0f - alpha) * slam_pose_.block<3,1>(0,3) + 
+                    alpha * ekf_guess_.block<3,1>(0,3);
+            }
+        } else {
+            current_guess = ekf_guess_;  // first frame only: use EKF global anchor
+        }
+            
         std::string matrix_error_reason;
         if (!isMatrixValid(current_guess, matrix_error_reason)) {
-            RCLCPP_ERROR(this->get_logger(), "❌ [Pose Guard] Discarded Frame: Initial EKF transformation guess is invalid! Reason: %s", 
+            RCLCPP_ERROR(this->get_logger(), "❌ [Pose Guard] Discarded Frame: Initial transformation guess is invalid! Reason: %s", 
                         matrix_error_reason.c_str());
             return;
         }
 
-        // Map Initialization Block (UPDATED)
         if (!map_initialized_) {
             pcl::PointCloud<pcl::PointXYZ>::Ptr transformed_cloud(new pcl::PointCloud<pcl::PointXYZ>());
             pcl::transformPointCloud(*downsampled, *transformed_cloud, current_guess);
             
-            // Apply height filter AFTER transform
             for (const auto& pt : transformed_cloud->points) {
-                if (pt.z > -1.0f && pt.z < 2.5f) {
+                if (pt.z > -0.5f && pt.z < 3.5f) {
                     target_map_cloud_->points.push_back(pt);
                 }
             }
             target_map_cloud_->width = target_map_cloud_->points.size();
             target_map_cloud_->height = 1;
             
-            if (target_map_cloud_->size() < 200) {
+            if (target_map_cloud_->size() < 50) {
                 RCLCPP_WARN(this->get_logger(), "❌ [Map Init] First scan has insufficient features (%zu pts). Waiting for denser data.", target_map_cloud_->size());
                 target_map_cloud_->clear();
                 return;
@@ -277,19 +306,21 @@ private:
             
             last_keyframe_pose_ = current_guess;
             map_initialized_ = true;
+            
+            slam_pose_ = current_guess;
+            last_ekf_pose_ = ekf_guess_;
+            slam_pose_initialized_ = true;
+
             RCLCPP_INFO(this->get_logger(), "🎯 NDT Map Anchored GLOBALLY at X:%.1f Y:%.1f", current_guess(0,3), current_guess(1,3));
             return;
         }
 
-        // Pre-alignment validation
         pcl::PointCloud<pcl::PointXYZ>::Ptr aligned_cloud(new pcl::PointCloud<pcl::PointXYZ>());
         ndt_.setInputSource(downsampled);
         
         Eigen::Matrix4f align_guess = current_guess;
-        // Add micro-translation offset to kick the optimization out of zero-gradient local minima trap
         align_guess(0,3) += 0.0001f; 
 
-        // Execute NDT execution inside a check layer
         ndt_.align(*aligned_cloud, align_guess); 
 
         if (!ndt_.hasConverged()) {
@@ -298,33 +329,44 @@ private:
         }
 
         Eigen::Matrix4f raw_result = ndt_.getFinalTransformation();
+        
+        double correction_dist = (raw_result.block<3,1>(0,3) - current_guess.block<3,1>(0,3)).norm();
+        if (correction_dist > 3.0) { 
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "⚠️ [NDT] Optimization diverged (Jumped %.2fm). Frame dropped.", correction_dist);
+            return;
+        }
+        
+        Eigen::Matrix3f R_delta = current_guess.block<3,3>(0,0).transpose() * raw_result.block<3,3>(0,0);
+        float yaw_correction = std::atan2(R_delta(1,0), R_delta(0,0));
+        if (std::abs(yaw_correction) > 0.5f) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
+                "⚠️ [NDT] Yaw jump of %.2f rad rejected", yaw_correction);
+            return;
+        }
+
         if (!isMatrixValid(raw_result, matrix_error_reason)) {
-            RCLCPP_ERROR(this->get_logger(), "❌ [Numerical Guard] Discarded Transformation: NDT reported convergence but result is unusable! Reason: %s", 
-                        matrix_error_reason.c_str());
+            RCLCPP_ERROR(this->get_logger(), "❌ [Numerical Guard] Result is unusable! Reason: %s", matrix_error_reason.c_str());
             return;
         }
 
         Matrix4f_Unaligned final_transform = raw_result;
 
-        // Map Expansion Block (UPDATED)
+        slam_pose_ = final_transform;
+        last_ekf_pose_ = ekf_guess_; 
+        slam_pose_initialized_ = true;
+
         double delta = (final_transform.block<3,1>(0,3) - last_keyframe_pose_.block<3,1>(0,3)).norm();
         if (delta > this->get_parameter("keyframe_distance").as_double()) {
+            
             bool should_extend = mapping_mode_;
             if (!mapping_mode_) {
-                double cur_x = final_transform(0,3), cur_y = final_transform(1,3);
-                double min_dist = std::numeric_limits<double>::max();
-                for (const auto& pt : target_map_cloud_->points) {
-                    double d = std::hypot(pt.x - cur_x, pt.y - cur_y);
-                    if (d < min_dist) min_dist = d;
-                    if (min_dist < 3.0) break; 
-                }
-                should_extend = (min_dist > this->get_parameter("map_extend_radius").as_double());
+                should_extend = (delta > this->get_parameter("map_extend_radius").as_double());
             }
 
             if (should_extend && target_map_cloud_->size() < 500000) {
-                // Build new points directly from aligned_cloud (already in world frame)
                 for (const auto& pt : aligned_cloud->points) {
-                    if (pt.z > -1.0f && pt.z < 2.5f) {
+                    if (pt.z > -0.5f && pt.z < 3.5f) {
                         target_map_cloud_->points.push_back(pt);
                     }
                 }
@@ -333,13 +375,10 @@ private:
                 pcl::PointCloud<pcl::PointXYZ>::Ptr new_map(new pcl::PointCloud<pcl::PointXYZ>());
                 voxel_filter_.filter(*new_map);
 
-                // ✅ Check the new map candidate FIRST
                 if (!setTargetSafe(new_map)) {
                     RCLCPP_WARN(this->get_logger(), "⚠️ [Map Append] Map update produced singular matrices. Reverting expansion.");
-                    return; // The old target_map_cloud_ remains safely untouched
+                    return; 
                 }
-
-                // If safe, formally update the global map pointer
                 target_map_cloud_ = new_map;
             }
             last_keyframe_pose_ = final_transform;
@@ -378,10 +417,17 @@ private:
     std::string map_file_;
     bool        mapping_mode_;
 
+    Eigen::Matrix4f lidar_to_base_;
+
     Matrix4f_Unaligned ekf_guess_;
     bool               ekf_initialized_;
     bool               map_initialized_;
     Matrix4f_Unaligned last_keyframe_pose_;
+
+    Matrix4f_Unaligned slam_pose_;          
+    bool               slam_pose_initialized_;            
+    float              ekf_trust_distance_;        
+    Matrix4f_Unaligned last_ekf_pose_;      
 };
 
 int main(int argc, char** argv) {

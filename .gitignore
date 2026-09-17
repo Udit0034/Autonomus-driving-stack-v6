@@ -48,7 +48,7 @@ shared_cache/
 
 # Generated metrics and data exports
 metrics.json
-eval_plots/ekf_metrics.json
+eval_temp/
 *.csv
 
 # Python package metadata

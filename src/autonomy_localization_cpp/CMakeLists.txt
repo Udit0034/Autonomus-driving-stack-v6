@@ -35,8 +35,10 @@ target_link_libraries(ndt_slam_node ${PCL_LIBRARIES})
 
 add_executable(visual_odometry_node src/visual_odometry_node.cpp)
 target_include_directories(visual_odometry_node PRIVATE ${OpenCV_INCLUDE_DIRS})
-target_link_libraries(visual_odometry_node ${OpenCV_LIBRARIES})
-ament_target_dependencies(visual_odometry_node rclcpp sensor_msgs nav_msgs geometry_msgs cv_bridge Eigen3 tf2)
+# 🎯 ADDED PCL_LIBRARIES HERE:
+target_link_libraries(visual_odometry_node ${OpenCV_LIBRARIES} ${PCL_LIBRARIES})
+# 🎯 ADDED pcl_ros AND pcl_conversions HERE:
+ament_target_dependencies(visual_odometry_node rclcpp sensor_msgs nav_msgs geometry_msgs cv_bridge Eigen3 tf2 pcl_ros pcl_conversions)
 
 install(TARGETS
   ekf_node

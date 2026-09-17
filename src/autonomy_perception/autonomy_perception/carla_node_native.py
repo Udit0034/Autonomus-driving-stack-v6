@@ -20,16 +20,16 @@ import time
 CAMS = {
     "front_left": {"fov": 90, "w": 1280, "h": 720, "x": 1.4, "y": -0.25, "z": 1.5, "pitch": -11.0, "yaw": 0.0, "roll": 0.0},
     "front_right": {"fov": 90, "w": 1280, "h": 720, "x": 1.4, "y": 0.25, "z": 1.5, "pitch": -11.0, "yaw": 0.0, "roll": 0.0},
-    # "rear": {"fov": 100, "w": 800, "h": 400, "x": -2.0, "y": 0.0, "z": 1.6, "pitch": -26.0, "yaw": 180.0, "roll": 0.0},
-    # "side_left": {"fov": 120, "w": 800, "h": 400, "x": 0.0, "y": -0.8, "z": 1.8, "pitch": -41.0, "yaw": -90.0, "roll": 0.0},
-    # "side_right": {"fov": 120, "w": 800, "h": 400, "x": 0.0, "y": 0.8, "z": 1.8, "pitch": -41.0, "yaw": 90.0, "roll": 0.0},
+    "rear": {"fov": 100, "w": 800, "h": 400, "x": -2.0, "y": 0.0, "z": 1.6, "pitch": -26.0, "yaw": 180.0, "roll": 0.0},
+    "side_left": {"fov": 120, "w": 800, "h": 400, "x": 0.0, "y": -0.8, "z": 1.8, "pitch": -41.0, "yaw": -90.0, "roll": 0.0},
+    "side_right": {"fov": 120, "w": 800, "h": 400, "x": 0.0, "y": 0.8, "z": 1.8, "pitch": -41.0, "yaw": 90.0, "roll": 0.0},
 }
 
 LIDAR_CFG = {
     "x": 0.0, "y": 0.0, "z": 2.10,
     "channels": 28, "upper_fov": 15.0, "lower_fov": -25.0,
     "range": 150.0,
-    "rotation_frequency": 20.0, 
+    "rotation_frequency": 10.0, 
     "points_per_second": 100000 
 }
 
@@ -39,7 +39,7 @@ RADAR_CFG = {
     "fl":    {"x": 1.8, "y": -0.8, "z": 0.5, "roll": 0.0, "pitch": 0.0, "yaw": -60.0, "h_fov": 100.0, "v_fov": 30.0, "range": 20.0},
     "fr":    {"x": 1.8, "y": 0.8, "z": 0.5, "roll": 0.0, "pitch": 0.0, "yaw": 60.0, "h_fov": 100.0, "v_fov": 30.0, "range": 20.0},
     "rl":    {"x": -1.8, "y": -0.8, "z": 0.5, "roll": 0.0, "pitch": 0.0, "yaw": -125.0, "h_fov": 98.0, "v_fov": 46.0, "range": 20.0},
-    "rr":    {"x": -1.8, "y": 0.8, "z": 0.5, "roll": 0.0, "pitch": 0.0, "yaw": 125.0, "h_fov": 100.0, "v_fov": 30.0, "range": 20.0}
+   "rr":    {"x": -1.8, "y": 0.8, "z": 0.5, "roll": 0.0, "pitch": 0.0, "yaw": 125.0, "h_fov": 100.0, "v_fov": 30.0, "range": 20.0}
 }
 
 class CarlaNodeNative(Node):
@@ -47,7 +47,7 @@ class CarlaNodeNative(Node):
         super().__init__('carla_node')
         self.declare_parameter('debug', False)
         self.debug = self.get_parameter('debug').get_parameter_value().bool_value
-        self.get_logger().info(f"CARLA Native ROS 2 Mode | Debug: {self.debug} | SYNC MODE: TRUE (20Hz)")
+        self.get_logger().info(f"CARLA Native ROS 2 Mode | Debug: {self.debug} | SYNC MODE: TRUE (100Hz base)")
         self._last_dest_idx = None
         self.actor_list = []
         self.npc_vehicles = []
@@ -56,8 +56,9 @@ class CarlaNodeNative(Node):
 
         self.running = True
         self.ego_vehicle = None
+        self.tick_count = 0
         
-        self.autopilot_enabled = False 
+        self.autopilot_enabled = True 
         self.route_generated = False
         
         self.spawn_start_time = None
@@ -83,18 +84,18 @@ class CarlaNodeNative(Node):
         
         self.connect_to_carla()
         
-        self.sync_timer = self.create_timer(0.05, self.publish_custom_odometry)
+        # Kept strictly at 100 Hz (0.01)
+        self.sync_timer = self.create_timer(0.01, self.publish_custom_odometry)
         
         self.spawn_pt = None
         self.mission_destinations = [] 
         self.srv_get_mission = self.create_service(Trigger, '/carla/get_mission', self.get_mission_callback)
 
     def mission_complete_callback(self, msg: Bool):
-        # If mission complete is True and we currently have a route
         if msg.data and self.route_generated:
             self.get_logger().info("🔄 Destination reached! Wiping old route and generating a new one...")
             self.route_generated = False
-            self.mission_payload_str = None  # Stop broadcasting the old plan
+            self.mission_payload_str = None
 
     def connect_to_carla(self):
         self.client = carla.Client('127.0.0.1', 2000)
@@ -105,7 +106,8 @@ class CarlaNodeNative(Node):
             
         settings = self.world.get_settings()
         settings.synchronous_mode = True
-        settings.fixed_delta_seconds = 0.05
+        # Kept strictly at 100 Hz (0.01)
+        settings.fixed_delta_seconds = 0.01
         self.world.apply_settings(settings)
         for tl in self.world.get_actors().filter('traffic.traffic_light'): 
             tl.set_state(carla.TrafficLightState.Green)
@@ -114,8 +116,9 @@ class CarlaNodeNative(Node):
         self.tm = self.client.get_trafficmanager(self.tm_port)
         self.tm.set_synchronous_mode(True)
         self.tm.set_global_distance_to_leading_vehicle(2.5)
-        self.tm.set_hybrid_physics_mode(True)
-        self.tm.set_hybrid_physics_radius(50.0)
+        # CRASH FIX: Disabled hybrid physics mode. This prevents ghost collisions 
+        # and physics teleports from vehicles entering/exiting the simulation radius.
+        self.tm.set_hybrid_physics_mode(False)
 
         self.spawn_ego_and_sensors()
         self.spawn_npcs()  
@@ -169,7 +172,7 @@ class CarlaNodeNative(Node):
         
         spawn_points = self.world.get_map().get_spawn_points()
         
-        for spawn_point in spawn_points[0:10]:
+        for spawn_point in spawn_points[0:20]:
             try:
                 self.ego_vehicle = self.world.spawn_actor(ego_bp, spawn_point)
                 self.spawn_start_time = time.time()
@@ -192,7 +195,7 @@ class CarlaNodeNative(Node):
             cam_bp.set_attribute('image_size_x', str(ext['w']))
             cam_bp.set_attribute('image_size_y', str(ext['h']))
             cam_bp.set_attribute('fov', str(ext['fov']))
-            cam_bp.set_attribute('sensor_tick', '0.05')
+            cam_bp.set_attribute('sensor_tick', '0.033333') # 30 Hz
             cam_bp.set_attribute('role_name', name)
             cam_bp.set_attribute('ros_name', name)
             
@@ -206,7 +209,7 @@ class CarlaNodeNative(Node):
                 depth_bp.set_attribute('image_size_x', str(ext['w']))
                 depth_bp.set_attribute('image_size_y', str(ext['h']))
                 depth_bp.set_attribute('fov', str(ext['fov']))
-                depth_bp.set_attribute('sensor_tick', '0.05')
+                depth_bp.set_attribute('sensor_tick', '0.033333') # 30 Hz
                 depth_bp.set_attribute('role_name', f'depth_{name}')
                 depth_bp.set_attribute('ros_name', f'depth_{name}')
                 depth = self.world.spawn_actor(depth_bp, tf, attach_to=self.ego_vehicle)
@@ -217,7 +220,7 @@ class CarlaNodeNative(Node):
                 seg_bp.set_attribute('image_size_x', str(ext['w']))
                 seg_bp.set_attribute('image_size_y', str(ext['h']))
                 seg_bp.set_attribute('fov', str(ext['fov']))
-                seg_bp.set_attribute('sensor_tick', '0.05')
+                seg_bp.set_attribute('sensor_tick', '0.033333') # 30 Hz
                 seg_bp.set_attribute('role_name', f'seg_{name}')
                 seg_bp.set_attribute('ros_name', f'seg_{name}')
                 seg = self.world.spawn_actor(seg_bp, tf, attach_to=self.ego_vehicle)
@@ -229,15 +232,30 @@ class CarlaNodeNative(Node):
         imu_bp = bp_lib.find('sensor.other.imu')
         imu_bp.set_attribute('role_name', 'imu')
         imu_bp.set_attribute('ros_name', 'imu')
-        imu_bp.set_attribute('sensor_tick', '0.05')
+        imu_bp.set_attribute('sensor_tick', '0.01') # 100 Hz
         imu = self.world.spawn_actor(imu_bp, carla.Transform(), attach_to=self.ego_vehicle)
         imu.enable_for_ros()
         self.actor_list.append(imu)
 
+        # --- PATCH 1: MAGNETOMETER SPAWN ---
+        mag_bp = bp_lib.find('sensor.other.imu')
+        mag_bp.set_attribute('role_name', 'magnetometer')
+        mag_bp.set_attribute('ros_name', 'magnetometer')
+        mag_bp.set_attribute('sensor_tick', '0.02') # 50 Hz
+        
+        mag_tf = carla.Transform(
+            carla.Location(x=0.0, y=0.0, z=.0),
+            carla.Rotation(pitch=0.0, yaw=0.0, roll=0.0) )
+        magnetometer = self.world.spawn_actor(mag_bp, mag_tf, attach_to=self.ego_vehicle)
+        magnetometer.enable_for_ros()
+        self.actor_list.append(magnetometer)
+        self.get_logger().info("✅ Magnetometer spawned ")
+        # -----------------------------------
+
         gnss_front_bp = bp_lib.find('sensor.other.gnss')
         gnss_front_bp.set_attribute('role_name', 'gnss_front')
         gnss_front_bp.set_attribute('ros_name', 'gnss_front')
-        gnss_front_bp.set_attribute('sensor_tick', '0.05')
+        gnss_front_bp.set_attribute('sensor_tick', '1.0') # 1 Hz
         gnss_front = self.world.spawn_actor(gnss_front_bp, carla.Transform(carla.Location(x=1.0, z=1.5)), attach_to=self.ego_vehicle)
         gnss_front.enable_for_ros()
         self.actor_list.append(gnss_front)
@@ -245,7 +263,7 @@ class CarlaNodeNative(Node):
         gnss_rear_bp = bp_lib.find('sensor.other.gnss')
         gnss_rear_bp.set_attribute('role_name', 'gnss_rear')
         gnss_rear_bp.set_attribute('ros_name', 'gnss_rear')
-        gnss_rear_bp.set_attribute('sensor_tick', '0.05')
+        gnss_rear_bp.set_attribute('sensor_tick', '1.0') # 1 Hz
         gnss_rear = self.world.spawn_actor(gnss_rear_bp, carla.Transform(carla.Location(x=-1.0, z=1.5)), attach_to=self.ego_vehicle)
         gnss_rear.enable_for_ros()
         self.actor_list.append(gnss_rear)
@@ -257,7 +275,7 @@ class CarlaNodeNative(Node):
         lidar_bp.set_attribute('range', str(LIDAR_CFG['range']))
         lidar_bp.set_attribute('upper_fov', str(LIDAR_CFG['upper_fov']))
         lidar_bp.set_attribute('lower_fov', str(LIDAR_CFG['lower_fov']))
-        lidar_bp.set_attribute('sensor_tick', '0.05')
+        lidar_bp.set_attribute('sensor_tick', '0.1') # 10 Hz
         lidar_bp.set_attribute('role_name', 'lidar_top')
         lidar_bp.set_attribute('ros_name', 'lidar_top')
 
@@ -275,7 +293,7 @@ class CarlaNodeNative(Node):
         spawn_points = self.world.get_map().get_spawn_points()
         random.shuffle(spawn_points)
         
-        for i in range(min(15, len(spawn_points))):
+        for i in range(min(0, len(spawn_points))):
             bp = random.choice(vehicle_bps)
             if bp.has_attribute('color'):
                 color = random.choice(bp.get_attribute('color').recommended_values)
@@ -331,6 +349,7 @@ class CarlaNodeNative(Node):
             return
         try:
             self.world.tick()
+            self.tick_count += 1
 
             # 1. GENERATE ONCE
             if not self.route_generated:
@@ -343,7 +362,6 @@ class CarlaNodeNative(Node):
                     self._last_dest_idx = chosen_idx
                     sampled_points = [all_spawn_points[chosen_idx]]
                     
-                    # Fetch the live location to guarantee 'spawn' is NEVER null
                     live_loc = self.ego_vehicle.get_transform().location
                     self.spawn_pt = (live_loc.x, -live_loc.y)
                     
@@ -356,9 +374,10 @@ class CarlaNodeNative(Node):
                     self.mission_payload_str = json.dumps(mission_payload)
                     
                     if self.autopilot_enabled:
-                        tm_waypoints_path = [pt.location for pt in sampled_points]
-                        self.tm.set_path(self.ego_vehicle, tm_waypoints_path)
-                        self.tm.vehicle_percentage_speed_difference(self.ego_vehicle, -20.0)
+                        # CRASH FIX: Removed self.tm.set_path(). 
+                        # Giving the TM a single point miles away makes it try to drive in a straight line through walls.
+                        # By removing it, TM relies on default road logic to wander safely while we still broadcast the target.
+                        self.tm.vehicle_percentage_speed_difference(self.ego_vehicle, 0.0) # Stick strictly to the speed limit
                         self.ego_vehicle.set_autopilot(True, self.tm_port)
                         self.get_logger().info(f"✅ Single Route Generated. CARLA Autopilot Engaged!")
                     else:
@@ -386,6 +405,7 @@ class CarlaNodeNative(Node):
             stamp = self.get_clock().now().to_msg()
             velocity = self.ego_vehicle.get_velocity()
             
+            # Ground truth odometry natively runs at 100 Hz
             odom_msg = Odometry()
             odom_msg.header.stamp = stamp
             odom_msg.header.frame_id = 'odom'
@@ -403,20 +423,34 @@ class CarlaNodeNative(Node):
             odom_msg.twist.twist.linear.z = velocity.z
             self.gt_odom_pub.publish(odom_msg)
 
-            gt_z_noisy = ego_transform.location.z + random.gauss(0.0, 0.3)
-            alt_msg = PointStamped()
-            alt_msg.header.stamp = stamp
-            alt_msg.header.frame_id = 'odom'
-            alt_msg.point.z = gt_z_noisy
-            self.altimeter_pub.publish(alt_msg)
+            # Publish Altimeter & Wheel Odom at 50 Hz (every 2nd tick of the 100 Hz loop)
+            if self.tick_count % 2 == 0:
+                gt_z_noisy = ego_transform.location.z + random.gauss(0.0, 0.3)
+                alt_msg = PointStamped()
+                alt_msg.header.stamp = stamp
+                alt_msg.header.frame_id = 'odom'
+                alt_msg.point.z = gt_z_noisy
+                self.altimeter_pub.publish(alt_msg)
 
-            gt_speed = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
-            odom_speed = gt_speed * 1.02 + random.gauss(0.0, 0.1) 
-            wheel_msg = Odometry()
-            wheel_msg.header.stamp = stamp
-            wheel_msg.header.frame_id = 'base_link'
-            wheel_msg.twist.twist.linear.x = odom_speed
-            self.wheel_odom_pub.publish(wheel_msg)
+                # --- PATCH 2: KINEMATIC WHEEL ODOMETRY ---
+                forward_vec = ego_transform.get_forward_vector()
+                v_x_local = (velocity.x * forward_vec.x) + (velocity.y * forward_vec.y) + (velocity.z * forward_vec.z)
+                
+                odom_speed = (v_x_local * 1.02) + random.gauss(0.0, 0.1)
+                
+                steer_norm = self.ego_vehicle.get_control().steer
+                steer_angle_rad = steer_norm * 1.22
+                noisy_steer = steer_angle_rad + random.gauss(0.0, 0.02) 
+                
+                wheel_msg = Odometry()
+                wheel_msg.header.stamp = stamp
+                wheel_msg.header.frame_id = 'base_link'
+                
+                wheel_msg.twist.twist.linear.x = odom_speed
+                wheel_msg.twist.twist.angular.z = noisy_steer 
+                
+                self.wheel_odom_pub.publish(wheel_msg)
+                # -----------------------------------------
             
         except Exception as e:
             self.get_logger().error(f"publish_custom_odometry failed: {e}", throttle_duration_sec=2.0)
